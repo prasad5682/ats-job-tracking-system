@@ -206,4 +206,157 @@ Architecture Overview
                      | Processes email  |
                      | sends via SMTP   |
                      +------------------+
-                     
+               
+               ## Run locally
+
+1. Create and activate virtual environment
+# Windows (PowerShell)
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+
+# Mac / Linux
+python3 -m venv .venv
+source .venv/bin/activate
+
+2. Install dependencies
+pip install -r requirements.txt
+
+3. Copy .env.example to .env and edit values
+# Windows
+copy .env.example .env
+# Mac / Linux
+cp .env.example .env
+# Then open .env and set correct DATABASE_URL, REDIS_URL, SECRET_KEY, SENDGRID_API_KEY, etc.
+
+4. Start Redis
+# If installed locally:
+redis-server
+# Or using Docker:
+docker run -d --name redis -p 6379:6379 redis
+
+5. Start PostgreSQL (if using Docker):
+docker run -d --name pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=atsdb -p 5432:5432 postgres
+
+6. Run database migrations (alembic)
+alembic upgrade head
+
+7. Start FastAPI server
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+8. Start Celery worker (in another terminal)
+# Use this exact command (adjust module path if needed)
+celery -A celery_app.celery worker --loglevel=info
+
+## Environment
+
+1. Copy .env.example to .env:
+# Windows
+copy .env.example .env
+# Mac / Linux
+cp .env.example .env
+
+2. Update values in .env:
+- DATABASE_URL (postgres connection)
+- REDIS_URL (redis URL)
+- SECRET_KEY (random string used for JWT)
+- ACCESS_TOKEN_EXPIRE_MINUTES (e.g. 60)
+- EMAIL_FROM and SENDGRID_API_KEY (or other email provider credentials)
+
+Do NOT commit `.env` to git (it's in .gitignore).
+
+## API Examples
+
+Register (candidate)
+POST http://127.0.0.1:8000/auth/register
+Headers: Content-Type: application/json
+Body:
+{
+  "full_name": "Test Candidate",
+  "email": "candidate@example.com",
+  "password": "Password123",
+  "role": "candidate"
+}
+
+Login
+POST http://127.0.0.1:8000/auth/login
+Headers: Content-Type: application/json
+Body:
+{
+  "email": "candidate@example.com",
+  "password": "Password123"
+}
+Response:
+{
+  "access_token": "<TOKEN>",
+  "token_type": "bearer",
+  "role": "candidate",
+  "user_id": 1
+}
+# Use access_token in Authorization header: "Authorization: Bearer <TOKEN>"
+
+Create Company (recruiter)
+# First register and login a recruiter with role "recruiter" (use email/password)
+POST /company/
+Headers: Authorization: Bearer <RECRUITER_TOKEN>
+Body:
+{
+  "name": "Acme Co",
+  "description": "Company description"
+}
+
+Create Job (recruiter)
+POST http://127.0.0.1:8000/jobs/
+Headers:
+  Authorization: Bearer <RECRUITER_TOKEN>
+  Content-Type: application/json
+Body:
+{
+  "title": "Backend Developer",
+  "description": "Work on API"
+}
+
+Apply to Job (candidate)
+POST http://127.0.0.1:8000/applications/apply/{job_id}
+Headers: Authorization: Bearer <CANDIDATE_TOKEN>
+(no body required)
+
+Change Stage (recruiter or hiring_manager)
+PUT http://127.0.0.1:8000/applications/{application_id}/stage
+Headers:
+  Authorization: Bearer <RECRUITER_TOKEN>
+  Content-Type: application/json
+Body:
+"Screening"
+
+## Testing & verification
+
+1. Start server and Celery worker (see Run locally).
+
+2. Register candidate and recruiter, login both and save tokens.
+
+3. As recruiter:
+   - Create a company (if company creation is required)
+   - Create a job and note its job_id
+
+4. As candidate:
+   - Apply to that job (POST /applications/apply/{job_id})
+   - Check response: application_id returned
+
+5. Celery verification:
+   - Watch the Celery worker terminal. When you apply, you should see a task received:
+     [INFO/MainProcess] Received task: app.tasks.email_tasks.notify_recruiter_new_application[...]
+     and then succeeded lines.
+   - When recruiter changes stage, worker should receive send_stage_change_email task.
+
+6. Check ApplicationHistory:
+   - Query database:
+     SELECT * FROM application_history WHERE application_id = <id> ORDER BY timestamp DESC;
+   - You should see entries for application creation and each stage change.
+
+7. RBAC checks:
+   - Try to create a job with a candidate token → should return 403.
+   - Try to change stage with candidate token → should return 403.
+   - Try to modify a job belonging to another company → should return 403.
+
+8. Workflow checks:
+   - Try invalid transition (Applied → Offer) -> API should return 400 and allowed transitions list.
