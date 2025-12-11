@@ -1,90 +1,152 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import List, Optional
 
 from app.database import get_db
 from app.models.job import Job
-from app.schemas.job import JobCreate, JobUpdate, JobOut
-from app.core.security import require_role
+from app.models.user import User
+from app.core.rbac import require_role
+from app.core.security import get_current_user
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
 
-# -------------------------
-# CREATE JOB (RECRUITER)
-# -------------------------
-@router.post("/", response_model=JobOut)
+# ---------------------------------------------------------
+# ✅ 1. CREATE JOB — Recruiter Only
+# ---------------------------------------------------------
+@router.post("/")
 def create_job(
-    job_data: JobCreate,
+    job_data: dict,
     db: Session = Depends(get_db),
-    current_user=Depends(require_role("recruiter"))
+    current_user: User = Depends(require_role("recruiter"))
 ):
+    # Recruiter must belong to a company
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="Recruiter is not assigned to any company")
+
     job = Job(
-        title=job_data.title,
-        description=job_data.description,
-        company_id=job_data.company_id
+        title=job_data.get("title"),
+        description=job_data.get("description"),
+        company_id=current_user.company_id,
+        status=job_data.get("status", "open").lower()
     )
+
+    if job.status not in ["open", "closed"]:
+        raise HTTPException(status_code=400, detail="Status must be 'open' or 'closed'")
+
     db.add(job)
     db.commit()
     db.refresh(job)
-    return job
+
+    return {
+        "message": "Job created successfully",
+        "job_id": job.id
+    }
 
 
-# -------------------------
-# LIST ALL JOBS (PUBLIC)
-# -------------------------
-@router.get("/", response_model=List[JobOut])
-def list_jobs(db: Session = Depends(get_db)):
-    jobs = db.query(Job).filter(Job.status == "open").all()
-    return jobs
-
-
-# -------------------------
-# GET SINGLE JOB DETAILS
-# -------------------------
-@router.get("/{job_id}", response_model=JobOut)
-def get_job(job_id: int, db: Session = Depends(get_db)):
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
-
-
+# ---------------------------------------------------------
+# ✅ 2. UPDATE JOB — Recruiter Only (same company)
+# ---------------------------------------------------------
 @router.put("/{job_id}")
 def update_job(
     job_id: int,
-    job_data: JobUpdate,
+    updates: dict,
     db: Session = Depends(get_db),
-    current_user=Depends(require_role("recruiter"))
+    current_user: User = Depends(require_role("recruiter"))
 ):
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    update_data = job_data.dict(exclude_unset=True)
+    # Recruiter must belong to same company
+    if job.company_id != current_user.company_id:
+        raise HTTPException(status_code=403, detail="Not allowed to modify this job")
 
-    for key, value in update_data.items():
-        setattr(job, key, value)
+    # Update fields
+    if "title" in updates:
+        job.title = updates["title"]
+    if "description" in updates:
+        job.description = updates["description"]
+    if "status" in updates:
+        status = updates["status"].lower()
+        if status not in ["open", "closed"]:
+            raise HTTPException(status_code=400, detail="Status must be 'open' or 'closed'")
+        job.status = status
 
     db.commit()
     db.refresh(job)
-    return job
+
+    return {
+        "message": "Job updated successfully",
+        "updated_job": job
+    }
 
 
-
-# -------------------------
-# DELETE JOB (RECRUITER)
-# -------------------------
+# ---------------------------------------------------------
+# ✅ 3. DELETE JOB — Recruiter Only (same company)
+# ---------------------------------------------------------
 @router.delete("/{job_id}")
 def delete_job(
     job_id: int,
     db: Session = Depends(get_db),
-    current_user=Depends(require_role("recruiter"))
+    current_user: User = Depends(require_role("recruiter"))
 ):
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    if job.company_id != current_user.company_id:
+        raise HTTPException(status_code=403, detail="Not allowed to delete this job")
+
     db.delete(job)
     db.commit()
+
     return {"message": "Job deleted successfully"}
+
+
+# ---------------------------------------------------------
+# ✅ 4. GET JOB BY ID — Everyone Can View
+# ---------------------------------------------------------
+@router.get("/{job_id}")
+def get_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return job
+
+
+# ---------------------------------------------------------
+# ✅ 5. LIST ALL JOBS — Everyone Can View
+# ---------------------------------------------------------
+@router.get("/")
+def list_jobs(
+    status: str = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(Job)
+
+    if status:
+        status = status.lower()
+        if status not in ["open", "closed"]:
+            raise HTTPException(status_code=400, detail="Status must be 'open' or 'closed'")
+        query = query.filter(Job.status == status)
+
+    return query.all()
+
+
+# ---------------------------------------------------------
+# ✅ 6. HIRING MANAGER — View all jobs in their company
+# ---------------------------------------------------------
+@router.get("/company/all")
+def company_jobs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("hiring_manager"))
+):
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="Hiring manager is not assigned to any company")
+
+    return db.query(Job).filter(Job.company_id == current_user.company_id).all()

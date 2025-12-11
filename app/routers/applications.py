@@ -6,9 +6,10 @@ from app.models.application import Application
 from app.models.application_history import ApplicationHistory
 from app.models.job import Job
 from app.models.user import User
-from app.core.workflow import is_valid_transition
+
+from app.core.workflow import is_valid_transition, get_allowed_transitions, VALID_STAGES
 from app.core.rbac import require_role
-from app.core.email import send_email   # now uses Celery automatically
+from app.tasks.email_tasks import send_stage_change_email, notify_recruiter_new_application
 from app.core.security import get_current_user
 
 router = APIRouter(prefix="/applications", tags=["Applications"])
@@ -27,20 +28,25 @@ def apply_to_job(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    existing = db.query(Application).filter(
-        Application.candidate_id == current_user.id,
-        Application.job_id == job_id
-    ).first()
+    # Prevent duplicate applications
+    existing = (
+        db.query(Application)
+        .filter(
+            Application.candidate_id == current_user.id,
+            Application.job_id == job_id
+        )
+        .first()
+    )
 
     if existing:
         raise HTTPException(status_code=400, detail="Already applied to this job")
 
+    # Create new application
     application = Application(
         candidate_id=current_user.id,
         job_id=job_id,
         stage="Applied"
     )
-
     db.add(application)
     db.commit()
     db.refresh(application)
@@ -48,35 +54,31 @@ def apply_to_job(
     # History entry
     history = ApplicationHistory(
         application_id=application.id,
-        old_stage="Applied",
+        old_stage=None,
         new_stage="Applied",
         changed_by=current_user.id
     )
     db.add(history)
     db.commit()
 
-    # ------------------------------------------------------
-    # 📩 CELERY EMAIL — Candidate Notification
-    # ------------------------------------------------------
-    send_email(
+    # 📩 Email to candidate (Async)
+    send_stage_change_email.delay(
         current_user.email,
-        "Application Submitted",
-        f"You successfully applied for {job.title}"
+        job.title,
+        "Applied"
     )
 
-    # ------------------------------------------------------
-    # 📩 CELERY EMAIL — Recruiter Notification (All recruiters)
-    # ------------------------------------------------------
+    # 📩 Email to all company recruiters (Async)
     recruiters = db.query(User).filter(
         User.role == "recruiter",
         User.company_id == job.company_id
     ).all()
 
     for r in recruiters:
-        send_email(
+        notify_recruiter_new_application.delay(
             r.email,
-            "New Application Received",
-            f"{current_user.full_name} applied for your job: {job.title}"
+            job.title,
+            current_user.email
         )
 
     return {
@@ -86,33 +88,40 @@ def apply_to_job(
 
 
 # ---------------------------------------------------------
-# ✅ 2. RECRUITER CHANGES STAGE
+# ✅ 2. RECRUITER OR HIRING MANAGER CHANGES STAGE
 # ---------------------------------------------------------
 @router.put("/{application_id}/stage")
 def change_stage(
     application_id: int,
     new_stage: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("recruiter"))
+    current_user: User = Depends(require_role("recruiter", "hiring_manager"))
 ):
-    application = db.query(Application).filter(Application.id == application_id).first()
+    new_stage = new_stage.strip().title()  # Normalize stage input
 
+    if new_stage not in VALID_STAGES:
+        raise HTTPException(status_code=400, detail=f"Invalid stage: {new_stage}")
+
+    application = db.query(Application).filter(Application.id == application_id).first()
     if not application:
         raise HTTPException(status_code=404, detail="Application not found")
 
     current_stage = application.stage
 
-    # Validate workflow
+    # Validate workflow transition
     if not is_valid_transition(current_stage, new_stage):
+        allowed = get_allowed_transitions(current_stage)
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid transition from {current_stage} → {new_stage}"
+            detail=f"Invalid transition {current_stage} → {new_stage}. Allowed: {allowed}"
         )
 
+    # Update stage
     application.stage = new_stage
     db.commit()
+    db.refresh(application)
 
-    # Save stage history
+    # Save history entry
     history = ApplicationHistory(
         application_id=application.id,
         old_stage=current_stage,
@@ -122,13 +131,11 @@ def change_stage(
     db.add(history)
     db.commit()
 
-    # ------------------------------------------------------
-    # 📩 CELERY EMAIL — Candidate status update
-    # ------------------------------------------------------
-    send_email(
+    # 📩 Notify candidate asynchronously
+    send_stage_change_email.delay(
         application.candidate.email,
-        "Application Status Updated",
-        f"Your application moved from {current_stage} → {new_stage}"
+        application.job.title,
+        new_stage
     )
 
     return {
@@ -140,7 +147,7 @@ def change_stage(
 
 
 # ---------------------------------------------------------
-# ✅ 3. CANDIDATE VIEWS THEIR OWN APPLICATIONS
+# ✅ 3. Candidate views their own applications
 # ---------------------------------------------------------
 @router.get("/my")
 def my_applications(
@@ -153,7 +160,7 @@ def my_applications(
 
 
 # ---------------------------------------------------------
-# ✅ 4. RECRUITER VIEWS APPLICATIONS FOR A JOB (filter optional)
+# ✅ 4. Recruiter views applications for a job
 # ---------------------------------------------------------
 @router.get("/job/{job_id}")
 def job_applications(
@@ -165,13 +172,14 @@ def job_applications(
     query = db.query(Application).filter(Application.job_id == job_id)
 
     if stage:
+        stage = stage.strip().title()
         query = query.filter(Application.stage == stage)
 
     return query.all()
 
 
 # ---------------------------------------------------------
-# ✅ 5. VIEW APPLICATION BY ID
+# ✅ 5. View application by ID
 # ---------------------------------------------------------
 @router.get("/{application_id}")
 def get_application(
@@ -184,15 +192,15 @@ def get_application(
     if not application:
         raise HTTPException(status_code=404, detail="Application not found")
 
-    # Candidate can only view their own application
+    # Candidate can only see their own application
     if current_user.role == "candidate" and application.candidate_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not allowed")
+        raise HTTPException(status_code=403, detail="Not authorized")
 
     return application
 
 
 # ---------------------------------------------------------
-# ✅ 6. HIRING MANAGER – View all company applications
+# ✅ 6. Hiring manager views all company applications
 # ---------------------------------------------------------
 @router.get("/company/{company_id}")
 def company_applications(
