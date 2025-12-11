@@ -101,8 +101,8 @@ Start Celery worker:
 
 nginx
 Copy code
-celery -A celery_app.celery_app worker --loglevel=info
-Emails are sent on:
+python -m celery -A celery_app.celery worker --loglevel=info --pool=solo
+
 
 ✔ Application submitted
 ✔ Application stage updated
